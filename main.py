@@ -13,8 +13,6 @@ import asyncio
 from huggingface_hub import hf_hub_download
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
-import boto3 
-import json 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,8 +23,6 @@ os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 openai_key = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=openai_key)  # Singleton OpenAI client
 TOKEN = os.getenv("TOKEN")
-aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
-aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
 
 # Discord bot setup
 intents = discord.Intents.default()
@@ -34,8 +30,6 @@ intents.messages = True
 intents.message_content = True
 
 client = discord.Client(intents=intents)
-boto_client = boto3.client('bedrock-runtime', region_name="eu-west-3", aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_access_key)
-model_id = "mistral.mistral-7b-instruct-v0:2"
 vdb = VDB()
 
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -46,39 +40,6 @@ async def on_ready():
     for guild in bot.guilds:
         for channel in guild.text_channels:
             bot.loop.create_task(vdb.index_channel_history(channel))
-
-# ask using bedrock 
-@bot.command()
-async def ask(ctx, *, question):
-    await ctx.send("Asking Bedrock...")
-    try:
-        # Define the prompt for the model
-        prompt = question
-
-        # Embed the prompt in Mistral's instruction format
-        formatted_prompt = f"<s>[INST] {prompt} [/INST]"
-
-        # Format the request payload using the model's native structure
-        native_request = {
-            "prompt": formatted_prompt,
-            "max_tokens": 512,
-            "temperature": 0.5,
-        }
-
-        # Convert the native request to JSON
-        request = json.dumps(native_request)
-
-        # Invoke the model with the request
-        response = boto_client.invoke_model(modelId=model_id, body=request)
-
-        # Decode the response body
-        model_response = json.loads(response["body"].read())
-
-        # Extract the response text
-        response_text = model_response["outputs"][0]["text"]
-        await ctx.send(response_text)
-    except Exception as e:
-        await ctx.send(f"Error: {e}")
 
 @bot.command()
 async def search(ctx, *, query):
@@ -227,53 +188,3 @@ signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
 
 bot.run(TOKEN)
-
-
-# @client.event
-# async def on_ready():
-#     logger.info(f'Logged in as {client.user}')
-#     for guild in client.guilds:
-#         for channel in guild.text_channels:
-#             await vdb.index_channel_history(channel)
-
-# @client.event
-# async def on_disconnect():
-#     vdb.save_faiss_index()
-#     vdb.save_message_storage()
-#     logger.info('Saved FAISS index and message storage to disk.')
-
-# @client.event
-# async def on_message(message):
-#     if message.author == client.user:
-#         return
-
-#     if message.content.startswith("!search "):
-#         query = message.content[len("!search "):]
-#         query_vec = vdb.vectorize(query)
-#         _, indices = vdb.db.search(np.array([query_vec]), k=5)
-#         results = []
-#         for idx in indices[0]:
-#             if idx != -1:
-#                 msg_meta = vdb.message_storage[idx]
-#                 link = f"https://discord.com/channels/{msg_meta['guild_id']}/{msg_meta['channel_id']}/{msg_meta['message_id']}"
-#                 results.append(f"Message: {msg_meta['content']} [Link]({link})")
-#             else:
-#                 results.append("Message not found")
-#         response = vdb.get_response(query, results)
-#         await message.channel.send(response)
-#     else:
-#         vdb.add_vector(message)
-
-# # Handle shutdown signals
-# def handle_shutdown(signal, frame):
-#     vdb.save_faiss_index()
-#     vdb.save_message_storage()
-#     logger.info('Saved FAISS index and message storage to disk.')
-#     loop = asyncio.get_event_loop()
-#     loop.stop()
-
-# # Register signal handlers
-# signal.signal(signal.SIGINT, handle_shutdown)
-# signal.signal(signal.SIGTERM, handle_shutdown)
-
-# client.run(TOKEN)
