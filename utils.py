@@ -1,16 +1,25 @@
-import pickle
-import faiss
+import asyncio 
+from v_database import VDB
+from youtube_transcript_api import YouTubeTranscriptApi
 
-def save_faiss_index(index, file_path):
-    faiss.write_index(index, file_path)
 
-def load_faiss_index(file_path):
-    return faiss.read_index(file_path)
+# Handle shutdown signals
+def handle_shutdown(signal, frame):
+    vdb.save_faiss_index()
+    vdb.save_message_storage()
+    print('Saved FAISS index and message storage to disk.')
+    loop = asyncio.get_event_loop()
+    loop.stop()
 
-def save_message_storage(storage, file_path):
-    with open(file_path, 'wb') as f:
-        pickle.dump(storage, f)
+# Function to fetch YouTube transcripts
+async def fetch_youtube_transcript(video_id):
+    transcript = YouTubeTranscriptApi.get_transcript(video_id)
+    transcript_text = " ".join([entry['text'] for entry in transcript])
+    return transcript_text
 
-def load_message_storage(file_path):
-    with open(file_path, 'rb') as f:
-        return pickle.load(f)
+# Function to fetch video ID from YouTube URL
+def get_video_id(url):
+    video_id_match = re.match(r'(https?://)?(www\.)?(youtube\.com|youtu\.?be)/.+(?:v=|/)([a-zA-Z0-9_-]{11})', url)
+    if video_id_match:
+        return video_id_match.group(4)
+    return None

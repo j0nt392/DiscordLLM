@@ -1,5 +1,5 @@
 import faiss
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -10,13 +10,11 @@ import discord
 from dotenv import load_dotenv
 import pickle
 import logging
-import ollama
 
 load_dotenv()
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 def average_pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
@@ -33,14 +31,16 @@ class VDB:
         self.openai_client = OpenAI(api_key=self.openai_key)
 
         # Load tokenizer and model with Hugging Face token for authentication
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        self.emb_tokenizer = AutoTokenizer.from_pretrained(
             'intfloat/multilingual-e5-large',
             token=self.huggingface_token
         )
-        self.model = AutoModel.from_pretrained(
+        self.emb_model = AutoModel.from_pretrained(
             'intfloat/multilingual-e5-large',
             token=self.huggingface_token
         )
+        #self.tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-instruct", token=self.huggingface_token)
+        #self.model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3-8B-instruct", token=self.huggingface_token)
 
         # Load or initialize FAISS index and message storage
         if os.path.exists(self.index_file) and os.path.exists(self.storage_file):
@@ -71,9 +71,9 @@ class VDB:
     def vectorize(self, text, is_query=True):
         prefix = "query: " if is_query else "passage: "
         input_text = prefix + text
-        inputs = self.tokenizer(input_text, return_tensors='pt', max_length=512, padding=True, truncation=True)
+        inputs = self.emb_tokenizer(input_text, return_tensors='pt', max_length=512, padding=True, truncation=True)
         with torch.no_grad():
-            outputs = self.model(**inputs)
+            outputs = self.emb_model(**inputs)
         embeddings = average_pool(outputs.last_hidden_state, inputs['attention_mask'])
         normalized_embeddings = F.normalize(embeddings, p=2, dim=1)
         return normalized_embeddings.squeeze().cpu().numpy()
@@ -88,6 +88,12 @@ class VDB:
             'message_id': text.id,
             'guild_id': text.guild.id
         }
+    
+    def add_vector_transcript(self, message):
+        index = len(self.message_storage)
+        vector = self.vectorize(message['content'], is_query=False)
+        self.db.add(np.array([vector]))
+        self.message_storage[index] = message
 
     async def index_channel_history(self, channel):
         try:
@@ -104,9 +110,17 @@ class VDB:
         prompt = f"This is the query from the user: {query}\nAnd these are the search results:\n"
         for i, result in enumerate(results):
             prompt += f"Result {i+1}: {result}\n"
-        prompt += "Please filter out any irrelevant or redundant results and provide a coherent response to the user's query. Always include the link to the original message."
+        prompt += "Please filter out any irrelevant or redundant results and provide a coherent response to the user's query. Always include the link to the original message, and keep it short and consice."
 
         try:
+            # inputs = self.tokenizer(prompt, return_tensors='pt', max_length=512, truncation=True)
+            # with torch.no_grad():
+            #     outputs = self.model.generate(
+            #         inputs['input_ids'], 
+            #         max_length=512,
+            #     )
+            # response_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # return response_text
             # response = ollama.chat(model='llama3', messages=[
             #     {
             #     'role': 'user',
@@ -115,10 +129,10 @@ class VDB:
             # ])
             # return response['message']['content']
             response = self.openai_client.completions.create(
-                model="gpt-3.5-turbo-instruct",
-                prompt=prompt,
-                max_tokens=2000,
-                temperature=0.7
+               model="gpt-3.5-turbo-instruct",
+               prompt=prompt,
+               max_tokens=2000,
+               temperature=0.7
             )
             response_text = response.choices[0].text.strip()
             return response_text
