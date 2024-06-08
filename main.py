@@ -1,9 +1,7 @@
-# invite link 
-#https://discord.com/oauth2/authorize?client_id=1240321223418970286&permissions=274877975552&scope=bot
 import discord
 from discord.ext import commands
 import numpy as np
-import os 
+import os
 from dotenv import load_dotenv
 from openai import OpenAI
 import logging
@@ -13,13 +11,16 @@ import asyncio
 from huggingface_hub import hf_hub_download
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
+from ratelimit import limits, RateLimitException
+from backoff import on_exception, expo
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 openai_key = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=openai_key)  # Singleton OpenAI client
 TOKEN = os.getenv("TOKEN")
@@ -34,6 +35,11 @@ vdb = VDB()
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Track user usage
+user_usage = {}
+ONE_MINUTE = 60
+DAILY_LIMIT = 5
+
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
@@ -41,8 +47,25 @@ async def on_ready():
         for channel in guild.text_channels:
             bot.loop.create_task(vdb.index_channel_history(channel))
 
+
 @bot.command()
+@commands.cooldown(1, 5, commands.BucketType.user)  # Cooldown
 async def search(ctx, *, query):
+    user_id = str(ctx.author.id)
+    current_time = time.time()
+
+    if user_id not in user_usage:
+        user_usage[user_id] = []
+
+    user_usage[user_id] = [
+        t for t in user_usage[user_id] if current_time - t < 86400]
+
+    if len(user_usage[user_id]) >= 5:
+        await ctx.send("You have reached your daily quota. Please try again tomorrow.")
+        return
+
+    user_usage[user_id].append(current_time)
+
     query_vec = vdb.vectorize(query, is_query=True)
     _, indices = vdb.db.search(np.array([query_vec]), k=5)
     results = []
@@ -50,60 +73,159 @@ async def search(ctx, *, query):
         if idx != -1:
             msg_meta = vdb.message_storage[idx]
             if 'video_title' in msg_meta:
-                link = f"https://www.youtube.com/watch?v={msg_meta['message_id']}"
-                results.append(f"Video: {msg_meta['video_title']}\nChunk: {msg_meta['content'][:200]}... [Link]({link})")
+                link = f"https://www.youtube.com/watch?v={
+                    msg_meta['message_id']}"
+                results.append(f"Video: {msg_meta['video_title']}\nChunk: {
+                               msg_meta['content'][:200]}... [Link]({link})")
             else:
-                link = f"https://discord.com/channels/{msg_meta['guild_id']}/{msg_meta['channel_id']}/{msg_meta['message_id']}"
-                results.append(f"Message: {msg_meta['content']} [Link]({link})")
+                link = f"https://discord.com/channels/{msg_meta['guild_id']}/{
+                    msg_meta['channel_id']}/{msg_meta['message_id']}"
+                results.append(
+                    f"Message: {msg_meta['content']} [Link]({link})")
         else:
             results.append("Message not found")
     response = vdb.get_response(query, results)
     await ctx.send(response)
 
 
+@search.error
+async def search_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"Please wait {error.retry_after:.2f} seconds before using this command again.")
+
+
 @bot.command()
+@commands.cooldown(1, 60, commands.BucketType.user)  # Cooldown
 async def yt_db(ctx, url):
+    user_id = str(ctx.author.id)
+    current_time = time.time()
+
+    if user_id not in user_usage:
+        user_usage[user_id] = []
+
+    user_usage[user_id] = [
+        t for t in user_usage[user_id] if current_time - t < 86400]
+
+    if len(user_usage[user_id]) >= 5:
+        await ctx.send("You have reached your daily quota. Please try again tomorrow.")
+        return
+
+    user_usage[user_id].append(current_time)
+
     await ctx.send("Fetching transcript from YouTube...")
-    
+
     video_id = get_video_id(url)
     if not video_id:
         await ctx.send("Invalid YouTube URL.")
         return
-    
+
     try:
         transcript = fetch_youtube_transcript(video_id)
+        if len(transcript) > 10000:
+            await ctx.send("Transcript is too long to process. Please provide a shorter video.")
+            return
     except Exception as e:
         await ctx.send(f"Failed to fetch transcript: {e}")
         return
-    
-    video_title = f"Video ID: {video_id}"  # You can modify this to fetch the actual title if needed
+
+    # You can modify this to fetch the actual title if needed
+    video_title = f"Video ID: {video_id}"
     await ctx.send("Adding transcript to the database...")
     add_transcript_to_db(transcript, video_id, video_title)
-    
+
     await ctx.send("Transcript added to the database.")
 
 
+@yt_db.error
+async def yt_db_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"Please wait {error.retry_after:.2f} seconds before using this command again.")
+
+# function to summarize text using gpt-4
+
+
+async def sum_vid(text, chunk_size=8000):
+    text_chunks = [text[i:i+chunk_size]
+                   for i in range(0, len(text), chunk_size)]
+
+    summaries = []
+    for chunk in text_chunks:
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": f"Summarize the following youtube-transcript:\n\n{chunk}"}]
+        response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=messages,
+            max_tokens=1024,
+            temperature=0.7,
+            top_p=1.0,
+            frequency_penalty=0.0,
+            presence_penalty=0.0
+        )
+        summaries.append(response.choices[0].message.content.strip())
+    combined_summary = " ".join(summaries)
+
+    if len(combined_summary) > chunk_size:
+        final_messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": f"Summarize the following youtube-transcript:\n\n{chunk}"}]        
+        final_response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=final_messages,
+            max_tokens=1024,
+            temperature=0.7,
+            top_p=1.0,
+            frequency_penalty=0.0,
+            presence_penalty=0.0
+        )
+        final_summary = final_response.choices[0].message.content.strip()
+        return final_summary
+    return combined_summary
+
+
 @bot.command()
+# Cooldown set to 120 seconds
+@commands.cooldown(1, 120, commands.BucketType.user)
 async def summarize(ctx, url):
+    user_id = str(ctx.author.id)
+    current_time = time.time()
+
+    if user_id not in user_usage:
+        user_usage[user_id] = []
+
+    user_usage[user_id] = [
+        t for t in user_usage[user_id] if current_time - t < 86400]
+
+    if len(user_usage[user_id]) >= 5:
+        await ctx.send("You have reached your daily quota. Please try again tomorrow.")
+        return
+
+    user_usage[user_id].append(current_time)
+
     await ctx.send("Fetching transcript from YouTube...")
-    
+
     video_id = get_video_id(url)
     if not video_id:
         await ctx.send("Invalid YouTube URL.")
         return
-    
+
     try:
         transcript = await fetch_youtube_transcript(video_id)
+        if len(transcript) > 1000000:
+            await ctx.send("Transcript is too long to process. Please provide a shorter video.")
+            return
     except Exception as e:
         await ctx.send(f"Failed to fetch transcript: {e}")
         return
-    
+
     await ctx.send("Summarizing transcript...")
 
     summary = await sum_vid(transcript)
     await ctx.send(summary)
 
 # Handle shutdown signals
+
+
 def handle_shutdown(signal, frame):
     vdb.save_faiss_index()
     vdb.save_message_storage()
@@ -112,18 +234,22 @@ def handle_shutdown(signal, frame):
     loop.stop()
 
 # Function to fetch YouTube transcripts
+
+
 async def fetch_youtube_transcript(video_id):
     transcript = YouTubeTranscriptApi.get_transcript(video_id)
     transcript_text = " ".join([entry['text'] for entry in transcript])
     return transcript_text
 
-def chunk_text(text, chunk_size=3000, overlap=500):
+
+def chunk_text(text, chunk_size=10000, overlap=500):
     words = text.split()
     chunks = []
     for i in range(0, len(words), chunk_size - overlap):
         chunk = " ".join(words[i:i+chunk_size])
         chunks.append(chunk)
     return chunks
+
 
 def add_transcript_to_db(transcript, video_id, video_title):
     chunks = chunk_text(transcript)
@@ -137,52 +263,17 @@ def add_transcript_to_db(transcript, video_id, video_title):
         }
         vdb.add_vector_transcript(message)
 
-# function to summarize youtube transcript with gpt3.5-instruct model
-async def sum_vid(text, chunk_size = 10000):    
-    # Split the text into chunks
-    text_chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-    
-    # Summarize each chunk
-    summaries = []
-    for chunk in text_chunks:
-        prompt = f"Summarize the following text:\n\n{chunk}"
-        response = openai_client.completions.create(
-            model="gpt-3.5-turbo-instruct",
-            prompt=prompt,
-            max_tokens=512,
-            temperature=0.7,
-            top_p=1.0,
-            frequency_penalty=0.0,
-            presence_penalty=0.0
-        )
-        summary = response.choices[0].text.strip()
-        summaries.append(summary)
-    
-    # Combine all summaries
-    combined_summary = " ".join(summaries)
-    
-    # If the combined summary is still too long, summarize it again
-    if len(combined_summary) > chunk_size:
-        final_prompt = f"Summarize the following text in no more than 350 words:\n\n{combined_summary}"
-        final_response = openai_client.completions.create(
-            model="gpt-3.5-turbo-instruct",
-            prompt=final_prompt,
-            max_tokens=512,
-            temperature=0.7,
-            top_p=1.0,
-            frequency_penalty=0.0,
-            presence_penalty=0.0
-        )
-        final_summary = final_response.choices[0].text.strip()
-        return final_summary
-    
-    return combined_summary
 # Function to fetch video ID from YouTube URL
+
+
 def get_video_id(url):
-    video_id_match = re.match(r'(https?://)?(www\.)?(youtube\.com|youtu\.?be)/.+(?:v=|/)([a-zA-Z0-9_-]{11})', url)
+    video_id_match = re.match(
+        r'(https?://)?(www\.)?(youtube\.com|youtu\.?be)/.+(?:v=|/)([a-zA-Z0-9_-]{11})', url)
     if video_id_match:
         return video_id_match.group(4)
     return None
+
+
 # Register signal handlers
 signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
