@@ -38,15 +38,37 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Track user usage
 user_usage = {}
 ONE_MINUTE = 60
-DAILY_LIMIT = 5
+DAILY_LIMIT = 20
 
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
     for guild in bot.guilds:
         for channel in guild.text_channels:
-            bot.loop.create_task(vdb.index_channel_history(channel))
+            if channel.name.lower() == "general":
+                await channel.send(f"Indexing {channel.name}...")
+                await vdb.index_channel_history(channel)
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            if channel.name.lower() == "general":
+                await channel.send("All channels indexed. Bot is ready\n\nInstructions: \n!search <query> to do a semantic search on this servers history.\n!summarize <youtubelink> to summarize a youtubevideo. (requires that the video has transcripts enabled).\n-yt_db <youtubelink> to index youtube-transcripts.\n\nAsk me anything and I shall provide you answers that are based on the history of this server as well as youtube-transcripts. For suggestions or feedback, please contact @jonatan. Thank you!")
 
+@bot.event
+async def on_message(message):
+    logger.info(f"Message received: {message.content}")
+    
+    # Ignore messages from the bot itself
+    if message.author == bot.user:
+        return
+
+    # Ignore messages starting with !search or !yt_db
+    if message.content.startswith('!search') or message.content.startswith('!yt_db') or message.content.startswith('!summarize'):
+        await bot.process_commands(message)
+        return
+
+    # Add the message to the vector database
+    vdb.add_vector(message)
+    await bot.process_commands(message)
 
 @bot.command()
 @commands.cooldown(1, 5, commands.BucketType.user)  # Cooldown
